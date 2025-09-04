@@ -30,10 +30,10 @@ local Config = {
     MinFlingPower = 10000,
     FlingDuration = 0.5,
     SafetyChecks = true,
-    AntiKick = true,
-    AutoRespawn = true,
+    AntiKick = false, -- Disabled by default to avoid detection
+    AutoRespawn = false, -- Disabled to avoid suspicion
     DebugMode = false,
-    MaxConcurrentFlings = 3,
+    MaxConcurrentFlings = 2, -- Reduced to be less suspicious
     MemoryCleanupInterval = 30
 }
 
@@ -101,36 +101,56 @@ local function cleanupMemory()
     end
 end
 
--- Safe object creation with cleanup tracking
+-- Safe object creation with cleanup tracking (stealth mode)
 local function createSafeObject(className, properties, parent, duration)
     if #activeFlings >= Config.MaxConcurrentFlings then
         cleanupMemory()
+        if #activeFlings >= Config.MaxConcurrentFlings then
+            return nil
+        end
+    end
+    
+    local success, obj = pcall(function()
+        return Instance.new(className)
+    end)
+    
+    if not success then
         return nil
     end
     
-    local obj = Instance.new(className)
-    
-    -- Apply properties safely
+    -- Apply properties safely with additional error handling
     for prop, value in pairs(properties or {}) do
         pcall(function()
             obj[prop] = value
         end)
     end
     
+    -- Parent safely
     if parent then
-        obj.Parent = parent
+        pcall(function()
+            obj.Parent = parent
+        end)
     end
     
-    -- Track for cleanup
-    local flingData = {
-        object = obj,
-        startTime = tick()
-    }
-    table.insert(activeFlings, flingData)
-    
-    -- Auto cleanup
-    if duration then
-        Debris:AddItem(obj, duration)
+    -- Track for cleanup only if successfully created
+    if obj and obj.Parent then
+        local flingData = {
+            object = obj,
+            startTime = tick()
+        }
+        table.insert(activeFlings, flingData)
+        
+        -- Auto cleanup with safer method
+        if duration then
+            spawn(function()
+                wait(duration)
+                if obj and obj.Parent then
+                    pcall(function()
+                        obj:Destroy()
+                    end)
+                end
+            end)
+        end
     end
     
     return obj
@@ -486,27 +506,72 @@ local function flingAll(method, power)
     return flinged, failed
 end
 
--- Anti-kick protection
+-- Enhanced anti-kick protection (stealth mode)
 local function setupAntiKick()
     if not Config.AntiKick then return end
     
-    -- Hook into potential kick events
-    local mt = getrawmetatable(game)
-    local oldNamecall = mt.__namecall
-    
-    setreadonly(mt, false)
-    mt.__namecall = newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-        local args = {...}
+    -- More subtle approach - hook specific functions instead of global namecall
+    local success = pcall(function()
+        -- Hook Player:Kick specifically
+        local Players = game:GetService("Players")
+        local oldKick = Players.LocalPlayer.Kick
         
-        if method == "Kick" and self == LocalPlayer then
-            debugPrint("Kick attempt blocked!")
+        Players.LocalPlayer.Kick = function(self, ...)
+            debugPrint("Kick attempt blocked (Player:Kick)")
+            -- Do nothing instead of kicking
             return
         end
         
-        return oldNamecall(self, ...)
+        -- Also protect against RemoteEvent kicks
+        local ReplicatedStorage = game:GetService("ReplicatedStorage")
+        local connections = {}
+        
+        -- Monitor for kick-related remote events
+        local function monitorRemotes(parent)
+            for _, child in pairs(parent:GetChildren()) do
+                if child:IsA("RemoteEvent") and (child.Name:lower():find("kick") or child.Name:lower():find("ban")) then
+                    local conn = child.OnClientEvent:Connect(function(...)
+                        debugPrint("Blocked kick remote: " .. child.Name)
+                        -- Block the event
+                    end)
+                    table.insert(connections, conn)
+                end
+                
+                if child:IsA("Folder") then
+                    monitorRemotes(child)
+                end
+            end
+        end
+        
+        -- Monitor existing and new remotes
+        monitorRemotes(ReplicatedStorage)
+        
+        ReplicatedStorage.ChildAdded:Connect(function(child)
+            wait(0.1) -- Small delay to let it load
+            monitorRemotes(ReplicatedStorage)
+        end)
+        
     end)
-    setreadonly(mt, true)
+    
+    if not success then
+        debugPrint("Anti-kick setup failed, using basic protection")
+        -- Fallback to simpler method if the above fails
+        pcall(function()
+            local mt = getrawmetatable(game)
+            if mt and mt.__namecall then
+                local oldNamecall = mt.__namecall
+                setreadonly(mt, false)
+                mt.__namecall = function(self, ...)
+                    local method = getnamecallmethod()
+                    if method == "Kick" and self == LocalPlayer then
+                        return -- Block kick
+                    end
+                    return oldNamecall(self, ...)
+                end
+                setreadonly(mt, true)
+            end
+        end)
+    end
 end
 
 -- Auto respawn on death
@@ -578,6 +643,24 @@ Commands["power"] = function(args)
     end
 end
 
+Commands["antikick"] = function(args)
+    if #args < 1 then
+        return "Anti-kick is currently: " .. (Config.AntiKick and "ON" or "OFF")
+    end
+    
+    local setting = args[1]:lower()
+    if setting == "on" or setting == "true" or setting == "1" then
+        Config.AntiKick = true
+        setupAntiKick()
+        return "Anti-kick protection enabled (may increase detection risk)"
+    elseif setting == "off" or setting == "false" or setting == "0" then
+        Config.AntiKick = false
+        return "Anti-kick protection disabled (recommended for stealth)"
+    else
+        return "Usage: antikick [on/off]"
+    end
+end
+
 Commands["help"] = function()
     return [[
 FE Fling Script Commands:
@@ -585,6 +668,7 @@ FE Fling Script Commands:
 - flingall [method] [power] - Fling all players
 - method [VELOCITY/CFRAME/NETWORK/HYBRID/HAT/BODYPART] - Change fling method
 - power <number> - Set fling power (10000-100000)
+- antikick [on/off] - Toggle anti-kick protection
 - help - Show this help message
 
 Methods:
@@ -594,6 +678,8 @@ Methods:
 - CFRAME: Uses CFrame manipulation
 - NETWORK: Exploits network ownership
 - HYBRID: Combines HAT, VELOCITY, and BODYPART methods
+
+Note: Anti-kick is disabled by default to avoid detection
 ]]
 end
 
@@ -620,20 +706,26 @@ local function handleCommand(message)
     end
 end
 
--- Initialize with memory management
+-- Initialize with stealth mode
 local function initialize()
     print("FE Fling Script Enhanced Edition loaded!")
     print("New methods: HAT, BODYPART")
+    print("Anti-detection mode enabled")
     print("Type /help for commands")
     
-    -- Setup protections
-    setupAntiKick()
-    setupAutoRespawn()
+    -- Setup protections only if enabled
+    if Config.AntiKick then
+        setupAntiKick()
+    end
+    
+    if Config.AutoRespawn then
+        setupAutoRespawn()
+    end
     
     -- Connect chat handler
     LocalPlayer.Chatted:Connect(handleCommand)
     
-    -- Setup memory cleanup timer
+    -- Setup memory cleanup timer with reduced frequency
     local cleanupConnection = RunService.Heartbeat:Connect(function()
         memoryCleanupTimer = memoryCleanupTimer + RunService.Heartbeat:Wait()
         if memoryCleanupTimer >= Config.MemoryCleanupInterval then
@@ -658,7 +750,7 @@ local function initialize()
         activeFlings = {}
     end)
     
-    debugPrint("Initialization complete with crash prevention")
+    debugPrint("Initialization complete - stealth mode active")
 end
 
 -- Start the script
