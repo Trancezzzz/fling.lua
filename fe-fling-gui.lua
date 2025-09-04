@@ -22,7 +22,7 @@ local LocalPlayer = Players.LocalPlayer
 
 -- Load the main fling script if not already loaded
 if not _G.FEFling then
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/your-repo/fe-fling-script.lua"))()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/Trancezzzz/fling.lua/main/fe-fling-script.lua"))()
 end
 
 -- GUI Configuration
